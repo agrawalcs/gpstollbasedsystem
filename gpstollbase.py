@@ -1,134 +1,112 @@
-import random
-import math
 import simpy
-import matplotlib.pyplot as plt
+from shapely.geometry import Point, LineString, Polygon
 import geopandas as gpd
-from shapely.geometry import Point, LineString
+from geopy.geocoders import Nominatim
+from geopy.distance import distance
+import folium
+from IPython.display import display
 
-# Week 2: Setup and Initial Development
-class GPSModule:
-    def __init__(self, env):
-        self.env = env
-        self.location = Point(0, 0)  # Initial location
+# Step 1: Define the Route (user input as city names)
+geolocator = Nominatim(user_agent="toll_simulation")
 
-    def update_location(self):
-        # Simulate GPS location update with random values
-        self.location = Point(random.uniform(0, 1000), random.uniform(0, 1000))
-        yield self.env.timeout(1)  # Simulate time taken to update location
-        return self.location
+def get_city_location(city_name):
+    location = geolocator.geocode(city_name)
+    if location:
+        return Point(location.longitude, location.latitude)
+    else:
+        print(f"Could not find location for {city_name}. Please enter a valid city name.")
+        return None
 
-class TollCalculator:
-    def __init__(self):
-        self.rate_per_km = 0.05  # Example rate
+# Get starting city location
+start_city = input("Enter starting city (e.g., Ahmedabad): ")
+start_point = get_city_location(start_city)
+while not start_point:
+    start_city = input("Enter starting city (e.g., Ahmedabad): ")
+    start_point = get_city_location(start_city)
 
-    def calculate_toll(self, distance):
-        return distance * self.rate_per_km
+# Get destination city location
+end_city = input("Enter destination city (e.g., Delhi): ")
+end_point = get_city_location(end_city)
+while not end_point:
+    end_city = input("Enter destination city (e.g., Delhi): ")
+    end_point = get_city_location(end_city)
 
-# Week 3: Integration and Testing
-class Vehicle:
-    def __init__(self, env, vehicle_id, gps_module, toll_calculator, initial_balance, owner_name):
-        self.env = env
-        self.vehicle_id = vehicle_id
-        self.gps_module = gps_module
-        self.toll_calculator = toll_calculator
-        self.previous_location = gps_module.location
-        self.total_toll = 0
-        self.total_distance = 0  # Track total distance covered
-        self.balance = initial_balance  # Driver's initial balance
-        self.owner_name = owner_name  # Owner's name
+# Calculate total distance
+total_distance = distance((start_point.y, start_point.x), (end_point.y, end_point.x)).km
 
-    def calculate_next_distance_and_toll(self):
-        next_location = yield self.env.process(self.gps_module.update_location())
-        distance_travelled = self.calculate_distance(self.previous_location, next_location)
-        toll = self.toll_calculator.calculate_toll(distance_travelled)
-        return next_location, distance_travelled, toll
+# Print total distance
+print(f"Total distance between {start_city} and {end_city}: {total_distance:.2f} kilometers")
 
-    def update_location_and_calculate_toll(self):
-        next_location, distance_travelled, toll = yield self.env.process(self.calculate_next_distance_and_toll())
-        self.previous_location = next_location
-        return distance_travelled, toll
+# Step 2: Simulate Vehicle Movement
+total_toll_charges = 0.0  # Variable to track total toll charges deducted
 
-    def deduct_toll(self, toll):
-        if self.balance >= toll:
-            self.balance -= toll
-            self.total_toll += toll
+def simulate_vehicle_movement(env, start_loc, end_loc, speed, user_account):
+    global total_toll_charges
+    current_loc = start_loc
+    while current_loc.distance(end_loc) > 0.1:
+        # Move towards the destination
+        direction_vector = LineString([current_loc, end_loc]).parallel_offset(distance=speed, side='right').coords[1]
+        new_loc = Point(direction_vector)
+
+        # Calculate distance traveled in this step
+        step_distance = current_loc.distance(new_loc)
+
+        # Calculate toll charge for this step
+        toll_charge = calculate_toll_charge(step_distance)
+        total_toll_charges += toll_charge  # Accumulate total toll charges
+        simulate_payment(env, toll_charge, user_account)
+
+        current_loc = new_loc
+        yield env.timeout(1)  # Simulate time passing
+
+    print("Vehicle reached destination.")
+
+# Step 3: Calculate Toll Charges
+toll_rate_per_km = 15.25  # Example toll rate per kilometer
+
+def calculate_toll_charge(distance):
+    return toll_rate_per_km * distance
+
+# Step 4: Simulate Payment
+class UserAccount:
+    def __init__(self, initial_balance):
+        self.balance = initial_balance
+
+    def deduct_balance(self, amount):
+        if self.balance >= amount:
+            self.balance -= amount
             return True
         else:
             return False
 
-    @staticmethod
-    def calculate_distance(location1, location2):
-        # Calculate Euclidean distance for simplicity
-        return location1.distance(location2)
-
-# Week 4: Final Development and Deployment
-class PaymentGateway:
-    def process_payment(self, vehicle, toll):
-        if vehicle.deduct_toll(toll):
-            print(f"Deducting ${toll:.2f} from vehicle {vehicle.vehicle_id}'s account owned by {vehicle.owner_name}. New balance: ${vehicle.balance:.2f}\n")
-            return True
-        else:
-            print(f"Vehicle {vehicle.vehicle_id} owned by {vehicle.owner_name} has insufficient funds for toll of ${toll:.2f}. Current balance: ${vehicle.balance:.2f}\n")
-            return False
-
-class VehicleWithPayment(Vehicle):
-    def __init__(self, env, vehicle_id, gps_module, toll_calculator, payment_gateway, initial_balance, owner_name):
-        super().__init__(env, vehicle_id, gps_module, toll_calculator, initial_balance, owner_name)
-        self.payment_gateway = payment_gateway
-        self.locations_visited = [self.previous_location]  # Store initial location
-
-    def update_location_and_process_payment(self):
-        distance_travelled, toll = yield self.env.process(self.update_location_and_calculate_toll())
-        if self.payment_gateway.process_payment(self, toll):
-            self.total_distance += distance_travelled
-            self.locations_visited.append(self.previous_location)  # Store visited location
-            yield self.env.timeout(1)  # Simulate time taken for payment processing
-            return distance_travelled, toll
-        else:
-            yield self.env.timeout(1)  # Simulate time taken for payment processing
-            return 0, 0  # No distance travelled and no toll incurred if payment fails
-
-def plot_vehicle_path(vehicle):
-    if len(vehicle.locations_visited) < 2:
-        print(f"Not enough points to plot path for vehicle {vehicle.vehicle_id}")
-        return
-    
-    gdf = gpd.GeoDataFrame(geometry=[Point(pt.x, pt.y) for pt in vehicle.locations_visited])
-    line = LineString(gdf.geometry)
-    gdf = gpd.GeoDataFrame(geometry=[line])
-    
-    gdf.plot()
-    plt.title(f'Vehicle {vehicle.vehicle_id} Path')
-    plt.xlabel('Longitude')
-    plt.ylabel('Latitude')
-    plt.grid(True)
-    plt.show()
-
-# Main function to run the simulation
+# Step 5: Main Simulation Setup
 def main():
+    initial_balance = float(input("Enter initial balance for the user account: "))
+    user_account = UserAccount(initial_balance)  # Create user account with initial balance
+
     env = simpy.Environment()
-    vehicles = []
-    for vehicle_id in range(1, 5):  # Reduced to 4 for simplicity
-        owner_name = input(f"Please enter the name for vehicle {vehicle_id}: ")
-        initial_balance = float(input(f"Please enter the initial balance for vehicle {vehicle_id}: "))
-        vehicles.append(VehicleWithPayment(env, vehicle_id, GPSModule(env), TollCalculator(), PaymentGateway(), initial_balance, owner_name))
+    env.process(simulate_vehicle_movement(env, start_point, end_point, speed=0.5, user_account=user_account))
+    env.run(until=2)  # Run simulation for 20 time units
 
-    # Simulate for 10 time steps
-    def simulation_step(env, vehicles):
-        for vehicle in vehicles:
-            yield env.process(vehicle.update_location_and_process_payment())
-        
-    for time_step in range(10):
-        print(f"\nTime step {time_step + 1}")
-        env.process(simulation_step(env, vehicles))
-        env.run(until=env.now + 1)
+    # Display total toll charges and remaining balance
+    print(f"\nTotal toll charges deducted: ${total_toll_charges:.2f}")
+    print(f"Remaining balance in user's account: ${user_account.balance:.2f}")
 
-    # Print total toll and distance covered for each vehicle
-    for vehicle in vehicles:
-        print(f"Total distance covered by vehicle {vehicle.vehicle_id} owned by {vehicle.owner_name}: {vehicle.total_distance:.2f} km")
-        print(f"Total toll for vehicle {vehicle.vehicle_id} owned by {vehicle.owner_name}: ${vehicle.total_toll:.2f}")
-        print(f"Final balance for vehicle {vehicle.vehicle_id} owned by {vehicle.owner_name}: ${vehicle.balance:.2f}")
-        plot_vehicle_path(vehicle)  # Plot the path of the vehicle
+    # Plot the route on a map using Folium
+    route_map = folium.Map(location=[start_point.y, start_point.x], zoom_start=6)
+    folium.Marker([start_point.y, start_point.x], popup=start_city).add_to(route_map)
+    folium.Marker([end_point.y, end_point.x], popup=end_city).add_to(route_map)
+    folium.PolyLine(locations=[[start_point.y, start_point.x], [end_point.y, end_point.x]], color='blue').add_to(route_map)
+
+    # Display the map directly in the output
+    display(route_map)
+
+# Step 6: Simulate Payment
+def simulate_payment(env, toll_charge, user_account):
+    if user_account.deduct_balance(toll_charge):
+        print(f"Toll charge of ${toll_charge:.2f} deducted from user's account. Remaining balance: ${user_account.balance:.2f}")
+    else:
+        print(f"Insufficient balance to deduct toll charge of ${toll_charge:.2f}. Remaining balance: ${user_account.balance:.2f}")
 
 if __name__ == "__main__":
     main()
